@@ -10,9 +10,98 @@
 //! - **Bool fields**: Treated as numeric TAG (1/0) with tag syntax
 //!
 //! Ensure your RediSearch schema matches the filter types you use.
+//!
+//! # Field Names
+//!
+//! Filter field names (the `key` argument) must be valid RediSearch identifiers
+//! matching the fields declared in your index schema. RediSearch field names
+//! are alphanumeric with underscores (`[a-zA-Z_][a-zA-Z0-9_]*`).
+//!
+//! # Filtering with Metadata
+//!
+//! Filters apply to fields that exist in your RediSearch index schema and are
+//! present in the stored hash keys. Configure [`RedisVectorStore::with_metadata_fields`](crate::RedisVectorStore::with_metadata_fields)
+//! to have metadata fields automatically extracted from documents during insertion.
+//! Only top-level scalar values (string, number, bool) are supported; null, array,
+//! and object values are silently skipped.
+//!
+//! # Dynamic API Subset
+//!
+//! The [`VectorStoreIndexDyn`](rig_core::vector_store::VectorStoreIndexDyn) path
+//! only supports the five [`CoreFilter`](rig_core::vector_store::request::Filter)
+//! variants: `Eq`, `Gt`, `Lt`, `And`, `Or`. Redis-specific methods like
+//! [`Filter::gte`], [`Filter::lte`], [`Filter::range`], [`Filter::tag_in`],
+//! [`Filter::text_contains`], and [`Filter::text_phrase`] are only accessible
+//! through the typed [`VectorStoreIndex`](rig_core::vector_store::VectorStoreIndex) API.
+//!
+//! # Escaping
+//!
+//! Tag values are automatically escaped for RediSearch special characters.
+//! See [`escape_tag_value`] for the list of escaped characters.
 
 use rig_core::vector_store::request::{Filter as CoreFilter, FilterError, SearchFilter};
 use serde::{Deserialize, Serialize};
+
+/// Characters that must be escaped with a backslash in RediSearch tag queries.
+///
+/// Per the [Redis documentation](https://redis.io/docs/latest/develop/ai/search-and-query/advanced-concepts/tags/),
+/// these characters have special meaning in tag query syntax:
+/// - `'` (single quote)
+/// - `-` (hyphen / negation)
+/// - `(`, `)` (parentheses / grouping)
+/// - `[`, `]`, `{`, `}` (brackets / range/tag delimiters)
+/// - `|` (pipe / OR operator)
+/// - `@` (field prefix)
+/// - `\\` (backslash / escape character itself)
+const TAG_ESCAPE_CHARS: &[char] = &['\'', '-', '(', ')', '[', ']', '{', '}', '|', '@', '\\'];
+
+/// Escapes special characters in a value for use in RediSearch tag queries.
+///
+/// Prepends a backslash to characters that have special meaning in RediSearch
+/// tag syntax to prevent query injection or parse failures.
+///
+/// # Example
+/// ```
+/// use rig_redis::filter::escape_tag_value;
+///
+/// assert_eq!(escape_tag_value("hello-world"), r"hello\-world");
+/// assert_eq!(escape_tag_value("it's"), r"it\'s");
+/// assert_eq!(escape_tag_value("foo|bar"), r"foo\|bar");
+/// ```
+pub fn escape_tag_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if TAG_ESCAPE_CHARS.contains(&ch) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+/// Characters that must be escaped with a backslash in RediSearch text field queries.
+///
+/// Per the [Redis tokenization documentation](https://redis.io/docs/latest/develop/ai/search-and-query/advanced-concepts/escaping/),
+/// these punctuation marks are token separators in TEXT fields:
+/// `,.<>{}[]"':;!@#$%^&*()-+=~`
+const TEXT_ESCAPE_CHARS: &[char] = &[
+    ',', '.', '<', '>', '{', '}', '[', ']', '"', '\'', ':', ';', '!', '@', '#', '$', '%', '^', '&',
+    '*', '(', ')', '-', '+', '=', '~', '|', '\\',
+];
+
+/// Escapes special characters in a value for use in RediSearch TEXT field queries.
+///
+/// Prepends a backslash to token-separator characters.
+pub fn escape_text_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if TEXT_ESCAPE_CHARS.contains(&ch) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
 
 /// Typed value for Redis filter expressions.
 ///
@@ -29,10 +118,12 @@ pub enum RedisValue {
 
 impl RedisValue {
     /// Formats value for tag-style filters (`@field:{value}` or `@field:{1}`).
+    ///
+    /// Values are escaped for RediSearch special characters.
     fn to_tag_expr(&self) -> String {
         match self {
             RedisValue::Number(n) => n.to_string(),
-            RedisValue::String(s) => s.clone(),
+            RedisValue::String(s) => escape_tag_value(s),
             RedisValue::Bool(b) => {
                 if *b {
                     "1".to_string()
@@ -42,6 +133,11 @@ impl RedisValue {
             }
         }
     }
+
+    /// Returns `true` if this value is numeric.
+    fn is_numeric(&self) -> bool {
+        matches!(self, RedisValue::Number(_))
+    }
 }
 
 impl From<i64> for RedisValue {
@@ -50,6 +146,10 @@ impl From<i64> for RedisValue {
     }
 }
 
+/// Converts a `u64` to [`RedisValue::Number`].
+///
+/// Note: values above 2⁵³ (9,007,199,254,740,992) will lose precision
+/// due to the `f64` representation.
 impl From<u64> for RedisValue {
     fn from(value: u64) -> Self {
         Self::Number(value as f64)
@@ -117,12 +217,14 @@ impl SearchFilter for Filter {
     /// Equality filter.
     ///
     /// - Numeric: `@field:[val val]` (exact range match)
-    /// - String: `@field:{value}` (tag match)
+    /// - String: `@field:{value}` (tag match, value is escaped)
     /// - Bool: `@field:{1}` or `@field:{0}` (tag match)
     fn eq(key: impl AsRef<str>, value: Self::Value) -> Self {
         match value {
             RedisValue::Number(n) => Self(format!("@{}:[{} {}]", key.as_ref(), n, n)),
-            RedisValue::String(ref s) => Self(format!("@{}:{{{}}}", key.as_ref(), s)),
+            RedisValue::String(ref s) => {
+                Self(format!("@{}:{{{}}}", key.as_ref(), escape_tag_value(s)))
+            }
             RedisValue::Bool(b) => {
                 let v = if b { "1" } else { "0" };
                 Self(format!("@{}:{{{}}}", key.as_ref(), v))
@@ -132,8 +234,20 @@ impl SearchFilter for Filter {
 
     /// Greater-than filter (exclusive).
     ///
-    /// Numeric: `@field:[(val +inf]`. Non-numeric falls back to tag syntax.
+    /// Numeric: `@field:[(val +inf]`.
+    ///
+    /// Non-numeric values are not meaningful for range comparisons and will
+    /// produce a tag-equality filter with a warning log. Prefer using [`Filter::eq`]
+    /// for non-numeric values.
     fn gt(key: impl AsRef<str>, value: Self::Value) -> Self {
+        if !value.is_numeric() {
+            tracing::warn!(
+                target: "rig",
+                field = %key.as_ref(),
+                "gt() called with non-numeric value; falling back to tag-equality semantics. \
+                 Use eq() for string/bool comparisons."
+            );
+        }
         match value {
             RedisValue::Number(n) => Self(format!("@{}:[({} +inf]", key.as_ref(), n)),
             _ => Self(format!("@{}:{{{}}}", key.as_ref(), value.to_tag_expr())),
@@ -142,8 +256,20 @@ impl SearchFilter for Filter {
 
     /// Less-than filter (exclusive).
     ///
-    /// Numeric: `@field:[-inf (val]`. Non-numeric falls back to tag syntax.
+    /// Numeric: `@field:[-inf (val]`.
+    ///
+    /// Non-numeric values are not meaningful for range comparisons and will
+    /// produce a tag-equality filter with a warning log. Prefer using [`Filter::eq`]
+    /// for non-numeric values.
     fn lt(key: impl AsRef<str>, value: Self::Value) -> Self {
+        if !value.is_numeric() {
+            tracing::warn!(
+                target: "rig",
+                field = %key.as_ref(),
+                "lt() called with non-numeric value; falling back to tag-equality semantics. \
+                 Use eq() for string/bool comparisons."
+            );
+        }
         match value {
             RedisValue::Number(n) => Self(format!("@{}:[-inf ({}]", key.as_ref(), n)),
             _ => Self(format!("@{}:{{{}}}", key.as_ref(), value.to_tag_expr())),
@@ -169,7 +295,16 @@ impl Filter {
     /// Greater than or equal (inclusive).
     ///
     /// Numeric: `@field:[val +inf]`.
+    ///
+    /// Non-numeric values produce a tag-equality filter with a warning.
     pub fn gte(key: impl AsRef<str>, value: <Self as SearchFilter>::Value) -> Self {
+        if !value.is_numeric() {
+            tracing::warn!(
+                target: "rig",
+                field = %key.as_ref(),
+                "gte() called with non-numeric value; falling back to tag-equality semantics."
+            );
+        }
         match value {
             RedisValue::Number(n) => Self(format!("@{}:[{} +inf]", key.as_ref(), n)),
             _ => Self(format!("@{}:{{{}}}", key.as_ref(), value.to_tag_expr())),
@@ -179,7 +314,16 @@ impl Filter {
     /// Less than or equal (inclusive).
     ///
     /// Numeric: `@field:[-inf val]`.
+    ///
+    /// Non-numeric values produce a tag-equality filter with a warning.
     pub fn lte(key: impl AsRef<str>, value: <Self as SearchFilter>::Value) -> Self {
+        if !value.is_numeric() {
+            tracing::warn!(
+                target: "rig",
+                field = %key.as_ref(),
+                "lte() called with non-numeric value; falling back to tag-equality semantics."
+            );
+        }
         match value {
             RedisValue::Number(n) => Self(format!("@{}:[-inf {}]", key.as_ref(), n)),
             _ => Self(format!("@{}:{{{}}}", key.as_ref(), value.to_tag_expr())),
@@ -198,15 +342,66 @@ impl Filter {
 
     /// Tag filter for multiple values (OR).
     ///
-    /// Produces `@field:{val1 | val2 | val3}`.
+    /// Produces `@field:{val1 | val2 | val3}`. Values are escaped for special characters.
+    ///
+    /// If `values` is empty, returns a match-all filter (`*`) to avoid producing
+    /// invalid RediSearch syntax.
     pub fn tag_in(key: impl AsRef<str>, values: Vec<String>) -> Self {
-        let tags = values.join(" | ");
+        if values.is_empty() {
+            return Self::raw("*");
+        }
+        let tags = values
+            .iter()
+            .map(|v| escape_tag_value(v))
+            .collect::<Vec<_>>()
+            .join(" | ");
         Self(format!("@{}:{{{}}}", key.as_ref(), tags))
     }
 
-    /// Full-text search within a TEXT field.
+    /// Full-text token search within a TEXT field.
+    ///
+    /// Performs a token-AND search: all words in `text` must appear in the field,
+    /// but they can appear in any order and at any position. This is **not** a
+    /// phrase search.
+    ///
+    /// The text value is escaped for RediSearch text-field special characters.
+    ///
+    /// Use [`Filter::text_phrase`] for exact phrase matching (word order preserved).
     pub fn text_contains(key: impl AsRef<str>, text: impl AsRef<str>) -> Self {
-        Self(format!("@{}:{}", key.as_ref(), text.as_ref()))
+        Self(format!(
+            "@{}:{}",
+            key.as_ref(),
+            escape_text_value(text.as_ref())
+        ))
+    }
+
+    /// Exact phrase search within a TEXT field.
+    ///
+    /// Matches the exact sequence of words in `phrase` (order matters).
+    /// Produces `@field:"phrase"` syntax.
+    ///
+    /// The phrase value is escaped for RediSearch text-field special characters
+    /// (except the wrapping quotes).
+    pub fn text_phrase(key: impl AsRef<str>, phrase: impl AsRef<str>) -> Self {
+        Self(format!(
+            "@{}:\"{}\"",
+            key.as_ref(),
+            escape_text_value(phrase.as_ref())
+        ))
+    }
+
+    /// Creates a filter from a raw RediSearch query string.
+    ///
+    /// No escaping is applied — the caller is responsible for correct syntax.
+    ///
+    /// # Security Warning
+    ///
+    /// Do **not** pass unsanitized user input to this method. Arbitrary RediSearch
+    /// query clauses can be injected, potentially returning unintended results or
+    /// causing query parse errors. Use the typed filter methods (e.g., [`Filter::eq`],
+    /// [`Filter::tag_in`]) for values that originate from user input.
+    pub fn raw(query: impl Into<String>) -> Self {
+        Self(query.into())
     }
 
     /// Consumes the filter and returns the raw RediSearch query string.

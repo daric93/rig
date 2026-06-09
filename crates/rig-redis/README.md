@@ -6,9 +6,46 @@ Vector store index integration for [Redis](https://redis.io/) using RediSearch v
 
 - Vector similarity search using Redis's RediSearch module
 - Support for KNN (k-nearest neighbors) queries
-- Metadata filtering with Redis query syntax
 - Document insertion with automatic embedding storage
 - Compatible with Redis 7.2+ or Redis Stack
+
+## Metadata Filtering
+
+To filter search results by document fields, configure metadata fields when
+creating the store. These fields are extracted from the serialized document JSON
+during insertion and written as separate hash fields that RediSearch can index.
+
+Your RediSearch index schema must declare these fields (TAG, NUMERIC, TEXT) in
+addition to the core fields (`document`, `embedded_text`, vector field).
+
+```bash
+FT.CREATE products_idx
+  ON HASH
+  PREFIX 1 prod:
+  SCHEMA
+    document TEXT
+    embedded_text TEXT
+    embedding VECTOR FLAT 6 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE
+    category TAG
+    price NUMERIC
+```
+
+```rust,no_run
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let store = RedisVectorStore::new(model, client, "products_idx".into(), "embedding".into())
+    .await?
+    .with_key_prefix("prod:".to_string())
+    .with_metadata_fields(vec!["category".to_string(), "price".to_string()]);
+
+// Documents with `category` and `price` fields will have those written
+// as hash fields, enabling filter queries like:
+// @category:{Electronics} or @price:[50 100]
+# Ok(())
+# }
+```
+
+Fields that are missing from a document or have null/array/object values are
+silently skipped.
 
 ## Prerequisites
 
@@ -38,25 +75,28 @@ Replace `1536` with your embedding model's dimensionality.
 
 ## Usage Example
 
-```rust
+```rust,no_run
 use rig::providers::openai;
 use rig::vector_store::{InsertDocuments, VectorStoreIndex};
 use rig_redis::RedisVectorStore;
 
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
 // Create embedding model
-let openai_client = openai::Client::from_env();
+let openai_client = openai::Client::from_env()?;
 let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_3_SMALL);
 
 // Create Redis client
 let redis_client = redis::Client::open("redis://127.0.0.1:6379")?;
 
-// Create vector store
+// Create vector store — key prefix must match the index PREFIX configuration
 let vector_store = RedisVectorStore::new(
     model,
     redis_client,
     "word_idx".to_string(),      // index name
     "embedding".to_string(),      // vector field name
-);
+)
+.await?
+.with_key_prefix("doc:".to_string());
 
 // Insert documents
 vector_store.insert_documents(documents).await?;
@@ -67,12 +107,14 @@ let results = vector_store
         VectorSearchRequest::builder()
             .query("your search query")
             .samples(5)
-            .build()?
+            .build()
     )
     .await?;
+# Ok(())
+# }
 ```
 
-You can find complete examples [here](https://github.com/0xPlaygrounds/rig/tree/main/rig-integrations/rig-redis/examples).
+You can find complete examples [here](https://github.com/0xPlaygrounds/rig/tree/main/crates/rig-redis/examples).
 
 ## Distance Metrics
 
@@ -88,12 +130,13 @@ Choose the metric that matches your embedding model when creating the index.
 - Requires pre-created RediSearch index
 - Vector dimensionality must match the index definition
 - Embeddings are stored as FLOAT32 (converted from FLOAT64)
+- Metadata filtering requires configuring `with_metadata_fields` during store creation; only top-level scalar fields (string/number/bool) are extracted
 
 ## Testing
 
 ### Prerequisites
 
-Integration tests require Docker to be running, as they use testcontainers to spin up a Redis Stack instance.
+Integration tests require Docker (or Podman) to be running, as they use testcontainers to spin up a Redis Stack instance.
 
 ### Running Tests
 
@@ -104,8 +147,8 @@ cargo test
 # Run only unit tests
 cargo test --lib
 
-# Run only integration tests
-cargo test --test integration_tests
+# Run only integration tests (requires Docker/Podman)
+cargo test --test integration_tests -- --ignored
 
 # Or use the Makefile
 make test              # All tests
@@ -124,7 +167,7 @@ make redis-local
 docker run -d --name redis-stack -p 6379:6379 redis/redis-stack:latest
 
 # Create a test index
-redis-cli FT.CREATE word_idx ON HASH SCHEMA document TEXT embedded_text TEXT embedding VECTOR FLAT 6 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE
+redis-cli FT.CREATE word_idx ON HASH PREFIX 1 doc: SCHEMA document TEXT embedded_text TEXT embedding VECTOR FLAT 6 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE
 
 # Run the example
 make run-example

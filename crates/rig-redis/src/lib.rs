@@ -10,6 +10,7 @@
 //! - A `document` field of type TEXT (stores serialized JSON)
 //! - An `embedded_text` field of type TEXT (stores the source text)
 //! - A vector field (configurable name) of type VECTOR with FLOAT32 elements
+//! - Optionally, additional fields for metadata filtering (TAG, NUMERIC, etc.)
 //!
 //! # Distance Metric
 //!
@@ -17,6 +18,16 @@
 //! Redis returns cosine distance (0 = identical, 2 = opposite), which is converted
 //! to cosine similarity (1 = identical, -1 = opposite) via `1.0 - distance`.
 //! Using a different distance metric (L2, IP) will produce incorrect similarity scores.
+//!
+//! # Metadata Filtering
+//!
+//! To enable filtering on document fields during search, configure metadata fields
+//! via [`RedisVectorStore::with_metadata_fields`]. These fields are extracted from
+//! the serialized document JSON during insertion and written as separate hash fields,
+//! making them available for RediSearch filter queries.
+//!
+//! Your RediSearch index schema must declare these fields with appropriate types
+//! (TAG, NUMERIC, TEXT) for filters to work.
 //!
 //! # Example
 //! ```ignore
@@ -27,7 +38,10 @@
 //!     redis_client,
 //!     "my_index".into(),
 //!     "embedding".into(),
-//! );
+//! )
+//! .await?
+//! .with_key_prefix("doc:".to_string())
+//! .with_metadata_fields(vec!["category".to_string(), "price".to_string()]);
 //! ```
 
 pub mod filter;
@@ -49,6 +63,18 @@ use serde::{Deserialize, Serialize};
 ///
 /// Uses Redis's `FT.SEARCH` command with KNN vector queries for similarity search.
 /// Internally holds a [`ConnectionManager`] for automatic reconnection on transient failures.
+///
+/// # Key Prefix
+///
+/// If your RediSearch index uses a `PREFIX` configuration (e.g., `PREFIX 1 doc:`),
+/// you **must** call [`RedisVectorStore::with_key_prefix`] with the matching prefix
+/// so that inserted documents are discoverable by the index.
+///
+/// # Metadata Fields
+///
+/// Configure metadata fields via [`RedisVectorStore::with_metadata_fields`] to enable
+/// filtering. During insertion, these fields are extracted from the serialized document
+/// and stored as separate hash fields that RediSearch can index and filter on.
 pub struct RedisVectorStore<M>
 where
     M: EmbeddingModel,
@@ -58,6 +84,7 @@ where
     index_name: String,
     vector_field: String,
     key_prefix: Option<String>,
+    metadata_fields: Vec<String>,
 }
 
 impl<M> RedisVectorStore<M>
@@ -93,15 +120,75 @@ where
             index_name,
             vector_field,
             key_prefix: None,
+            metadata_fields: Vec::new(),
         })
     }
 
     /// Sets a key prefix for document keys.
     ///
     /// Documents stored via [`InsertDocuments`] will be keyed as `{prefix}{uuid}`.
-    /// This prefix should match the index's `PREFIX` configuration.
+    /// This prefix **must** match the index's `PREFIX` configuration for documents
+    /// to be indexed and discoverable by `FT.SEARCH`.
     pub fn with_key_prefix(mut self, prefix: String) -> Self {
         self.key_prefix = Some(prefix);
+        self
+    }
+
+    /// Configures metadata fields to extract from documents during insertion.
+    ///
+    /// When documents are inserted, the specified fields are extracted from the
+    /// serialized JSON representation and written as separate hash fields. This
+    /// makes them available for RediSearch filter queries (TAG, NUMERIC, TEXT).
+    ///
+    /// The field names must match top-level keys in the serialized document JSON
+    /// **and** must be declared in the RediSearch index schema.
+    ///
+    /// Fields that are missing from a document or have null/complex values are
+    /// silently skipped with a warning log.
+    ///
+    /// Reserved field names (`document`, `embedded_text`, and the configured vector
+    /// field) are filtered out with a warning to prevent data corruption.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Given a document struct:
+    /// #[derive(Serialize, Embed)]
+    /// struct Product {
+    ///     name: String,
+    ///     category: String,
+    ///     price: f64,
+    ///     #[embed]
+    ///     description: String,
+    /// }
+    ///
+    /// // And an index created with:
+    /// // FT.CREATE products ON HASH PREFIX 1 prod:
+    /// //   SCHEMA document TEXT embedded_text TEXT embedding VECTOR FLAT 6 ...
+    /// //   category TAG price NUMERIC
+    ///
+    /// let store = RedisVectorStore::new(model, client, "products".into(), "embedding".into())
+    ///     .await?
+    ///     .with_key_prefix("prod:".to_string())
+    ///     .with_metadata_fields(vec!["category".to_string(), "price".to_string()]);
+    /// ```
+    pub fn with_metadata_fields(mut self, fields: Vec<String>) -> Self {
+        let reserved = ["document", "embedded_text", self.vector_field.as_str()];
+        self.metadata_fields = fields
+            .into_iter()
+            .filter(|f| {
+                if reserved.contains(&f.as_str()) {
+                    tracing::warn!(
+                        target: "rig",
+                        field = %f,
+                        "Metadata field name conflicts with reserved hash field, skipping"
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
         self
     }
 
@@ -146,18 +233,39 @@ where
     }
 
     /// Parses FT.SEARCH response into results with deserialized documents.
+    ///
+    /// Documents with empty or unparseable JSON are skipped with a warning rather
+    /// than aborting the entire result set.
     fn parse_search_response<T>(
         response: redis::Value,
     ) -> Result<Vec<(f64, String, T)>, VectorStoreError>
     where
         T: for<'a> Deserialize<'a>,
     {
-        Self::parse_response_generic(response, true).and_then(|items| {
+        Self::parse_response_generic(response, true).map(|items| {
             items
                 .into_iter()
-                .map(|(score, id, doc_json)| {
-                    let doc = serde_json::from_str::<T>(&doc_json)?;
-                    Ok((score, id, doc))
+                .filter_map(|(score, id, doc_json)| {
+                    if doc_json.is_empty() {
+                        tracing::warn!(
+                            target: "rig",
+                            id = %id,
+                            "Document field missing or empty in hash, skipping"
+                        );
+                        return None;
+                    }
+                    match serde_json::from_str::<T>(&doc_json) {
+                        Ok(doc) => Some((score, id, doc)),
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "rig",
+                                id = %id,
+                                error = %e,
+                                "Failed to deserialize document, skipping"
+                            );
+                            None
+                        }
+                    }
                 })
                 .collect()
         })
@@ -216,6 +324,7 @@ where
                     };
 
                     let mut score = 0.0;
+                    let mut score_found = false;
                     let mut document_json = String::new();
 
                     let mut field_iter = fields_val.chunks(2);
@@ -227,6 +336,7 @@ where
 
                         if field_name == "__vector_score" {
                             score = Self::extract_score(value_val)?;
+                            score_found = true;
                         } else if include_document && field_name == "document" {
                             match Self::extract_string(value_val) {
                                 Some(json) => document_json = json,
@@ -239,6 +349,14 @@ where
                                 }
                             }
                         }
+                    }
+
+                    if !score_found {
+                        tracing::warn!(
+                            target: "rig",
+                            id = %id,
+                            "__vector_score field missing from search result, defaulting to 0.0"
+                        );
                     }
 
                     results.push((score, id, document_json));
@@ -293,13 +411,28 @@ where
 
         cmd.arg("DIALECT").arg(2);
 
-        if req.threshold().is_some() {
-            cmd.arg("LIMIT").arg(0).arg(req.samples());
-        }
+        // Always specify LIMIT to override RediSearch's default of 10 results.
+        cmd.arg("LIMIT").arg(0).arg(req.samples());
 
         cmd.query_async(&mut con)
             .await
             .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))
+    }
+
+    /// Converts a JSON value to a string suitable for storage in a Redis hash field.
+    ///
+    /// - Strings are stored as-is (unquoted).
+    /// - Numbers and booleans are converted to their string representation.
+    /// - Null, arrays, and objects return `None` (not storable as flat hash fields).
+    fn json_value_to_hash_field(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::Bool(b) => Some(if *b { "1".to_string() } else { "0".to_string() }),
+            serde_json::Value::Null
+            | serde_json::Value::Array(_)
+            | serde_json::Value::Object(_) => None,
+        }
     }
 }
 
@@ -307,6 +440,13 @@ impl<Model> InsertDocuments for RedisVectorStore<Model>
 where
     Model: EmbeddingModel + Send + Sync,
 {
+    /// Inserts documents with their precomputed embeddings into Redis.
+    ///
+    /// Each embedding in [`OneOrMany<Embedding>`] produces a separate Redis hash
+    /// keyed by `{prefix}{uuid}`. All hashes for a given document share the same
+    /// serialized JSON in the `document` field but have distinct `embedded_text`
+    /// values (one per embedding). This means a single logical document may produce
+    /// multiple hash entries if it has multiple embeddings.
     async fn insert_documents<Doc: Serialize + Embed + Send>(
         &self,
         documents: Vec<(Doc, OneOrMany<Embedding>)>,
@@ -315,7 +455,32 @@ where
         let mut pipe = redis::pipe();
 
         for (document, embeddings) in &documents {
-            let json_document = serde_json::to_string(document)?;
+            let json_value = serde_json::to_value(document)?;
+            let json_document = json_value.to_string();
+
+            // Extract metadata fields from the document JSON if configured.
+            let metadata: Vec<(String, String)> = if self.metadata_fields.is_empty() {
+                Vec::new()
+            } else {
+                self.metadata_fields
+                    .iter()
+                    .filter_map(|field_name| {
+                        let value = json_value.get(field_name)?;
+                        match Self::json_value_to_hash_field(value) {
+                            Some(hash_value) => Some((field_name.clone(), hash_value)),
+                            None => {
+                                tracing::warn!(
+                                    target: "rig",
+                                    field = %field_name,
+                                    value_type = %value,
+                                    "Metadata field has unsupported type (null/array/object), skipping"
+                                );
+                                None
+                            }
+                        }
+                    })
+                    .collect()
+            };
 
             for embedding in embeddings.iter() {
                 let id = if let Some(ref prefix) = self.key_prefix {
@@ -325,15 +490,22 @@ where
                 };
                 let embedding_bytes = Self::embedding_to_bytes(&embedding.vec);
 
-                pipe.cmd("HSET")
+                let cmd = pipe
+                    .cmd("HSET")
                     .arg(&id)
                     .arg("document")
                     .arg(json_document.as_bytes())
                     .arg("embedded_text")
                     .arg(embedding.document.as_bytes())
                     .arg(&self.vector_field)
-                    .arg(embedding_bytes)
-                    .ignore();
+                    .arg(embedding_bytes);
+
+                // Write metadata fields as separate hash fields.
+                for (field_name, field_value) in &metadata {
+                    cmd.arg(field_name).arg(field_value.as_bytes());
+                }
+
+                cmd.ignore();
             }
         }
 
@@ -345,6 +517,7 @@ where
             target: "rig",
             index = %self.index_name,
             count = documents.len(),
+            metadata_fields = ?self.metadata_fields,
             "Inserted documents into Redis vector store"
         );
 
